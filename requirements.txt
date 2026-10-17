@@ -1,0 +1,6 @@
+instaloader
+fastapi
+uvicorn
+pytest
+httpx
+
