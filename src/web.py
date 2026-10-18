@@ -101,17 +101,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </label>
         </div>
 
-        <details class="session-details">
+        <details class="session-details" open>
           <summary>Session Authentication (Required by Instagram for Comments)</summary>
           <div class="session-body">
             <p class="help-text">
-              Instagram strictly requires an active login session to paginate comments.<br>
-              1. Run <code class="code-badge">instaloader -l &lt;username&gt;</code> in your terminal once to log in.<br>
-              2. Enter your username below to use that saved session:
+              Instagram strictly requires an authenticated session to paginate comments.<br>
+              <strong style="color: var(--accent);">Option 1 (Recommended &amp; Easiest - No password or 2FA needed):</strong><br>
+              Paste your Instagram <code class="code-badge">sessionid</code> cookie from your browser.<br>
+              <em>How to get it:</em> In your browser (Chrome / Edge / Firefox), open <b>instagram.com</b> &rarr; press <code class="code-badge">F12</code> (Developer Tools) &rarr; go to <b>Application</b> tab (or <b>Storage</b> in Firefox) &rarr; <b>Cookies</b> &rarr; copy the value of <b>sessionid</b>.<br><br>
+              <strong>Option 2:</strong> Enter your Instagram username &amp; password for a direct login.
             </p>
             <div class="form-group">
-              <label for="session_user" style="font-size: 0.8rem;">Session Username</label>
+              <label for="session_id" style="font-size: 0.8rem; color: var(--accent); font-weight: 600;">Instagram sessionid Cookie (Recommended)</label>
+              <input type="text" id="session_id" name="session_id" placeholder="Paste sessionid cookie here (e.g. 45738607704%3A...)">
+            </div>
+            <div class="form-group">
+              <label for="session_user" style="font-size: 0.8rem;">Instagram Username (Optional if sessionid is pasted)</label>
               <input type="text" id="session_user" name="session_user" placeholder="e.g. teoo.mnl" value="teoo.mnl">
+            </div>
+            <div class="form-group">
+              <label for="password" style="font-size: 0.8rem;">Instagram Password (Optional)</label>
+              <input type="password" id="password" name="password" placeholder="Leave empty if using sessionid">
             </div>
             <div class="form-group" style="margin-bottom: 0;">
               <label for="session_file" style="font-size: 0.8rem;">Custom Session File Path (Optional)</label>
@@ -156,13 +166,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const url = document.getElementById('url').value.trim();
       const includeOwner = document.getElementById('include_owner').checked;
       const includeReplies = document.getElementById('include_replies').checked;
+      const sessionId = document.getElementById('session_id').value.trim();
       const sessionUser = document.getElementById('session_user').value.trim();
+      const password = document.getElementById('password').value;
       const sessionFile = document.getElementById('session_file').value.trim();
       return {
         url: url,
         include_owner: includeOwner,
         include_replies: includeReplies,
+        session_id: sessionId || null,
         session_user: sessionUser || null,
+        password: password || null,
         session_file: sessionFile || null,
       };
     }
@@ -286,7 +300,9 @@ async def _parse_request_payload(request: Request) -> dict[str, Any]:
             "url": data.get("url", ""),
             "include_owner": bool(data.get("include_owner", False)),
             "include_replies": bool(data.get("include_replies", True)),
+            "session_id": data.get("session_id"),
             "session_user": data.get("session_user"),
+            "password": data.get("password"),
             "session_file": data.get("session_file"),
         }
 
@@ -296,14 +312,18 @@ async def _parse_request_payload(request: Request) -> dict[str, Any]:
     url = parsed_qs.get("url", [""])[0]
     include_owner = parsed_qs.get("include_owner", ["false"])[0] in ("true", "True", "on", "1", True)
     include_replies = parsed_qs.get("include_replies", ["true"])[0] in ("true", "True", "on", "1", True)
+    session_id = parsed_qs.get("session_id", [None])[0]
     session_user = parsed_qs.get("session_user", [None])[0]
+    password = parsed_qs.get("password", [None])[0]
     session_file = parsed_qs.get("session_file", [None])[0]
 
     return {
         "url": url,
         "include_owner": include_owner,
         "include_replies": include_replies,
+        "session_id": session_id,
         "session_user": session_user,
+        "password": password,
         "session_file": session_file,
     }
 
@@ -321,10 +341,13 @@ def create_app(provider: CommentProvider | None = None) -> FastAPI:
 
         active_provider = provider
         if active_provider is None:
+            session_id = payload.get("session_id") or None
             session_user = payload.get("session_user") or None
+            password = payload.get("password") or None
             session_file = Path(payload["session_file"]) if payload.get("session_file") else None
 
-            if not session_user and not session_file:
+            # Auto-detect username from saved instaloader sessions if not provided
+            if not session_user and not session_file and not session_id:
                 try:
                     import instaloader.instaloader as il_mod
                     s_dir = Path(il_mod.get_default_session_filename("dummy")).parent
@@ -334,21 +357,42 @@ def create_app(provider: CommentProvider | None = None) -> FastAPI:
                 except Exception:
                     pass
 
+            # Try instagrapi (mobile API) first — much more reliable
             try:
-                active_provider = InstaloaderCommentProvider(
+                from src.instagrapi_provider import InstagrapiCommentProvider
+                active_provider = InstagrapiCommentProvider(
                     session_user=session_user,
-                    session_file=session_file,
+                    session_id=session_id,
+                    password=password,
+                    instaloader_session_file=session_file,
                 )
-            except FileNotFoundError as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Session file not found: {exc}",
-                ) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to initialize session: {exc}",
-                ) from exc
+            except Exception as instagrapi_exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Mobile API provider failed (%s), falling back to Instaloader",
+                    instagrapi_exc,
+                )
+                # Fall back to instaloader
+                try:
+                    active_provider = InstaloaderCommentProvider(
+                        session_user=session_user,
+                        session_file=session_file,
+                        session_id=session_id,
+                    )
+                except FileNotFoundError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Session file not found: {exc}",
+                    ) from exc
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Failed to initialize session: {exc}. "
+                            f"Mobile API also failed: {instagrapi_exc}. "
+                            f"Try providing your password for a fresh login."
+                        ),
+                    ) from exc
 
         try:
             result = extract_usernames(
@@ -362,8 +406,7 @@ def create_app(provider: CommentProvider | None = None) -> FastAPI:
                 status_code=401,
                 detail=(
                     "Instagram requires an authenticated session to access comments. "
-                    "Please enter your username under 'Session Authentication'. "
-                    "Run 'instaloader -l <username>' in your terminal to save a session."
+                    "Please enter your username and password under 'Session Authentication'."
                 ),
             ) from exc
         except RateLimitExceededError as exc:

@@ -12,7 +12,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from src.exporter import write_usernames_file
 from src.extractor import CommentProvider, extract_usernames
-from src.instaloader_provider import InstaloaderCommentProvider
 from src.url_parser import InvalidInstagramURLError, parse_instagram_url
 
 
@@ -49,7 +48,57 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to saved Instaloader session file",
     )
+    parser.add_argument(
+        "--session-id",
+        "--sessionid",
+        dest="session_id",
+        default=None,
+        help="Direct Instagram sessionid cookie string from your browser (recommended)",
+    )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Instagram password for fresh login via mobile API (only needed once; session is saved)",
+    )
+    parser.add_argument(
+        "--use-instaloader",
+        action="store_true",
+        help="Force using the old Instaloader/GraphQL provider instead of the mobile API",
+    )
     return parser
+
+
+def _create_provider(args: argparse.Namespace) -> CommentProvider:
+    """Creates the best available CommentProvider based on CLI args."""
+    session_file = Path(args.session_file) if args.session_file else None
+
+    # If explicitly requested, use instaloader
+    if args.use_instaloader:
+        from src.instaloader_provider import InstaloaderCommentProvider
+        return InstaloaderCommentProvider(
+            session_user=args.session_user,
+            session_file=session_file,
+            session_id=args.session_id,
+        )
+
+    # Default: use instagrapi (mobile API) — much more reliable
+    try:
+        from src.instagrapi_provider import InstagrapiCommentProvider
+        return InstagrapiCommentProvider(
+            session_user=args.session_user,
+            session_id=args.session_id,
+            password=args.password,
+            instaloader_session_file=session_file,
+        )
+    except Exception as exc:
+        sys.stderr.write(f"Mobile API provider failed: {exc}\n")
+        sys.stderr.write("Falling back to Instaloader/GraphQL provider...\n")
+        from src.instaloader_provider import InstaloaderCommentProvider
+        return InstaloaderCommentProvider(
+            session_user=args.session_user,
+            session_file=session_file,
+            session_id=args.session_id,
+        )
 
 
 def main(
@@ -66,12 +115,8 @@ def main(
         return 1
 
     if provider is None:
-        session_file = Path(args.session_file) if args.session_file else None
         try:
-            provider = InstaloaderCommentProvider(
-                session_user=args.session_user,
-                session_file=session_file,
-            )
+            provider = _create_provider(args)
         except Exception as exc:
             sys.stderr.write(f"Error initializing session: {exc}\n")
             return 1

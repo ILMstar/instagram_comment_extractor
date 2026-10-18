@@ -201,7 +201,7 @@ def test_cli_wires_session_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
             from src.extractor import PostMetadata
             return PostMetadata(shortcode=shortcode, owner_username="owner", comments=[])
 
-    monkeypatch.setattr("src.cli.InstaloaderCommentProvider", DummyProvider)
+    monkeypatch.setattr("src.instagrapi_provider.InstagrapiCommentProvider", DummyProvider)
 
     session_path = tmp_path / "session_file"
     exit_code = cli.main([
@@ -213,5 +213,6 @@ def test_cli_wires_session_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 
     assert exit_code == 0
     assert created_provider_kwargs.get("session_user") == "my_user"
-    assert created_provider_kwargs.get("session_file") == session_path
+    assert created_provider_kwargs.get("instaloader_session_file") == session_path
+
 

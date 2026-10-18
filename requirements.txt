@@ -1,4 +1,5 @@
 instaloader
+instagrapi
 fastapi
 uvicorn
 pytest

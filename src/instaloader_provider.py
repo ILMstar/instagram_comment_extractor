@@ -14,6 +14,7 @@ from typing import Any, Callable, Generator, Iterable
 import instaloader
 from instaloader.exceptions import (
     ConnectionException,
+    LoginRequiredException,
     QueryReturnedBadRequestException,
     TooManyRequestsException,
 )
@@ -91,6 +92,7 @@ class InstaloaderCommentProvider(CommentProvider):
         self,
         session_user: str | None = None,
         session_file: Path | None = None,
+        session_id: str | None = None,
         max_retries: int = 5,
         base_delay_sec: float = 3.0,
         loader: Any | None = None,
@@ -100,18 +102,39 @@ class InstaloaderCommentProvider(CommentProvider):
     ) -> None:
         self.session_user = session_user
         self.session_file = session_file
+        self.session_id = session_id
         self.max_retries = max_retries
         self.base_delay_sec = base_delay_sec
         self.sleep_fn = sleep_fn
         self.jitter = jitter
-        self.loader = loader or instaloader.Instaloader()
+        self.loader = loader or instaloader.Instaloader(max_connection_attempts=3)
         self._post_loader = post_loader or instaloader.Post.from_shortcode
 
-        if session_file is not None:
+        if session_id:
+            if hasattr(self.loader, "context") and hasattr(self.loader.context, "_session"):
+                self.loader.context._session.cookies.set("sessionid", session_id.strip(), domain=".instagram.com")
+        elif session_file is not None:
             user = session_user or Path(session_file).stem
             self.loader.load_session_from_file(user, filename=str(session_file))
+            self._validate_session(user)
         elif session_user is not None:
             self.loader.load_session_from_file(session_user)
+            self._validate_session(session_user)
+
+    def _validate_session(self, user: str) -> None:
+        """Checks if the loaded session contains a non-empty sessionid cookie."""
+        if (
+            isinstance(self.loader, instaloader.Instaloader)
+            and hasattr(self.loader, "context")
+            and hasattr(self.loader.context, "_session")
+        ):
+            cookies = self.loader.context._session.cookies
+            sid = cookies.get("sessionid", domain=".instagram.com") or cookies.get("sessionid")
+            if not sid or not str(sid).strip():
+                raise RateLimitExceededError(
+                    f"Instaloader session file for '{user}' contains an empty or expired sessionid (logged out). "
+                    "Please provide your browser's sessionid cookie or log in again."
+                )
 
     def _calculate_backoff_delay(self, attempt: int) -> float:
         delay = self.base_delay_sec * (2 ** (attempt - 1))
@@ -175,13 +198,15 @@ class InstaloaderCommentProvider(CommentProvider):
         return RawComment(owner_username=username, replies=replies)
 
     def _get_comments_with_fallback(self, post: Any, shortcode: str) -> Iterable[Any]:
-        """Tries normal get_comments(), falls back to GraphQL if iPhone API fails.
+        # If it's a real instaloader Post and the session is not logged in, fail fast
+        if hasattr(post, "_context") and not getattr(post._context, "is_logged_in", True):
+            raise LoginRequiredException("Login required to access comments of a post.")
 
-        If post is a real instaloader.Post with comments > 12, instaloader's get_comments()
-        would always invoke the iPhone API endpoint which rejects browser cookie sessions.
-        In that case, we directly use the GraphQL endpoint to avoid a 90-second retry timeout.
-        """
-        if hasattr(post, "_context") and getattr(post, "comments", 0) > instaloader.NodeIterator.page_length():
+        if (
+            hasattr(post, "_context")
+            and getattr(post._context, "is_logged_in", False)
+            and getattr(post, "comments", 0) > instaloader.NodeIterator.page_length()
+        ):
             logger.info("Post %s has >12 comments; using GraphQL pagination directly", shortcode)
             return self._retry_call(
                 lambda: _get_comments_graphql_fallback(post),
