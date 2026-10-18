@@ -264,43 +264,72 @@ class InstagrapiCommentProvider(CommentProvider):
         owner_username = media_info.user.username if media_info.user else ""
 
         def comment_generator() -> Generator[RawComment, None, None]:
-            # Fetch all top-level comments via mobile API
-            comments = self._retry(
-                lambda: self.client.media_comments(media_id, amount=0),
-                description=f"Fetching comments for {shortcode}",
-            )
+            params: dict[str, Any] = {"can_support_threading": "true"}
 
-            for comment in comments:
-                username = comment.user.username if comment.user else "unknown"
-
-                # Build a lazy generator for threaded replies
-                child_count = getattr(comment, "child_comment_count", 0) or 0
-
-                def make_reply_gen(c_pk: int, count: int) -> Iterable[RawComment]:
-                    """Creates a reply generator, closed over the specific comment pk."""
-                    def gen() -> Generator[RawComment, None, None]:
-                        if count <= 0:
-                            return
-                        try:
-                            replies = self._retry(
-                                lambda: self.client.media_comment_replies(
-                                    media_id, c_pk, amount=0
-                                ),
-                                description=f"Fetching replies for comment {c_pk}",
-                            )
-                            for reply in replies:
-                                r_user = reply.user.username if reply.user else "unknown"
-                                yield RawComment(owner_username=r_user, replies=[])
-                        except Exception as exc:
-                            logger.warning(
-                                "Failed to fetch replies for comment %s: %s", c_pk, exc
-                            )
-                    return gen()
-
-                yield RawComment(
-                    owner_username=username,
-                    replies=make_reply_gen(comment.pk, child_count),
+            while True:
+                res = self._retry(
+                    lambda: self.client.private_request(f"media/{media_id}/comments/", params),
+                    description=f"Fetching comments for {shortcode}",
                 )
+                raw_comments = res.get("comments", [])
+                if not raw_comments:
+                    break
+
+                for c in raw_comments:
+                    username = c.get("user", {}).get("username", "unknown")
+                    c_pk = c.get("pk")
+                    child_count = c.get("child_comment_count", 0) or 0
+                    preview_replies = c.get("preview_child_comments", []) or []
+
+                    def make_reply_gen(parent_pk: Any, count: int, preloaded: list) -> Iterable[RawComment]:
+                        """Creates a lazy reply generator for threaded child comments."""
+                        def gen() -> Generator[RawComment, None, None]:
+                            seen_pks = set()
+                            # 1. Yield any preloaded preview replies first
+                            for r in preloaded:
+                                r_pk = r.get("pk")
+                                if r_pk:
+                                    seen_pks.add(r_pk)
+                                r_user = r.get("user", {}).get("username", "unknown")
+                                yield RawComment(owner_username=r_user, replies=[])
+
+                            # 2. If there are additional replies, fetch full thread
+                            if count > len(preloaded) and parent_pk:
+                                try:
+                                    full_replies = self._retry(
+                                        lambda: self.client.media_comment_replies(
+                                            media_id, str(parent_pk), amount=0
+                                        ),
+                                        description=f"Fetching replies for comment {parent_pk}",
+                                    )
+                                    for r in full_replies:
+                                        if r.pk not in seen_pks:
+                                            seen_pks.add(r.pk)
+                                            r_user = r.user.username if r.user else "unknown"
+                                            yield RawComment(owner_username=r_user, replies=[])
+                                except Exception as exc:
+                                    logger.warning(
+                                        "Failed to fetch replies for comment %s: %s", parent_pk, exc
+                                    )
+                        return gen()
+
+                    yield RawComment(
+                        owner_username=username,
+                        replies=make_reply_gen(c_pk, child_count, preview_replies),
+                    )
+
+                # Check pagination cursor
+                has_next = (res.get("has_more_comments") and res.get("next_max_id")) or (
+                    res.get("has_more_headload_comments") and res.get("next_min_id")
+                )
+                if not has_next:
+                    break
+
+                params = {"can_support_threading": "true"}
+                if res.get("has_more_comments") and res.get("next_max_id"):
+                    params["max_id"] = res.get("next_max_id")
+                elif res.get("has_more_headload_comments") and res.get("next_min_id"):
+                    params["min_id"] = res.get("next_min_id")
 
         return PostMetadata(
             shortcode=shortcode,
